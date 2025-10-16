@@ -1,0 +1,14 @@
+CREATE DATABASE CFDI_DB;
+USE CFDI_DB;
+
+CREATE TABLE IF NOT EXISTS Proveedores (
+    rfc VARCHAR(13) PRIMARY KEY,
+    nombre VARCHAR(255)
+);
+
+CREATE TABLE IF NOT EXISTS Precios_Documentos (
+    uuid_original VARCHAR(36) PRIMARY KEY,
+    rfc_emisor VARCHAR(13),
+    imp_pagado FLOAT,
+    fecha_pago DATETIME
+);
