@@ -7,6 +7,7 @@ from mysql.connector import Error as MySQLError
 
 # --- 1. CONFIGURACIÓN DE LA APLICACIÓN Y BASE DE DATOS (AWS MySQL RDS) ---
 
+
 app = Flask(__name__)
 app.secret_key = 'clave_secreta_para_sesiones' # ¡Cámbiala por una clave fuerte!
 
