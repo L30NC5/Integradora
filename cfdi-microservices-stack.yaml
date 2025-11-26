@@ -1,0 +1,945 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Infraestructura CFDI Microservicios (1VPC, 2Sub, 2BD, 5Lambda, APIGW)
+
+Parameters:
+  DBPassword:
+    Type: String
+    Description: Contraseña Maestra para RDS.
+    NoEcho: true
+    MinLength: 8
+  DBMasterUser:
+    Type: String
+    Default: root
+  CodeBucketName:
+    Type: String
+    Description: Nombre del bucket S3 para el código de Lambda y Beanstalk.
+
+Resources:
+  
+  CFDIVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      Tags:
+        - Key: Name
+          Value: CFDI-VPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CFDIVPC
+      AvailabilityZone: !Select [0, !GetAZs ]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public-CFDI
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CFDIVPC
+      AvailabilityZone: !Select [0, !GetAZs ]
+      CidrBlock: 10.0.10.0/24
+      Tags:
+        - Key: Name
+          Value: Private-CFDI
+          
+  CFDIInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref CFDIVPC
+      InternetGatewayId: !Ref CFDIInternetGateway
+      
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref CFDIVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref CFDIInternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subred Privada para RDS
+      SubnetIds:
+        - !Ref PrivateSubnet
+
+  CFDI_RDS_Consolidada:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: cfdi-consolidada-min
+      DBName: CFDI_DB
+      AllocatedStorage: 20
+      DBInstanceClass: db.t3.micro 
+      Engine: mysql
+      MasterUsername: !Ref DBMasterUser
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      
+  CFDI_DynamoDB_Cache:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CFDI-Microservice-Cache
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AmazonDynamoDBReadOnlyAccess
+        
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref CFDIVPC
+      GroupDescription: Acceso de Lambda y EB a RDS
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+          
+  CFDI_Lambda_VerificadorSAT:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 1-VerificadorSAT
+      Handler: index.verificar_cfdi_sat
+      Runtime: python3.11
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnet] 
+        SecurityGroupIds: [!GetAtt LambdaSecurityGroup.GroupId]
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: lambda/verificador_sat.zip 
+        
+  CFDI_Lambda_ConsultarProveedor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 2-ConsultarProveedor
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnet]
+        SecurityGroupIds: [!GetAtt LambdaSecurityGroup.GroupId]
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: lambda/consultar_proveedor.zip
+
+  CFDI_Lambda_ObtenerImpuestos:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 3-ObtenerImpuestos
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnet]
+        SecurityGroupIds: [!GetAtt LambdaSecurityGroup.GroupId]
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: lambda/obtener_impuestos.zip
+
+  CFDI_Lambda_NotificarCambio:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 4-NotificarCambio
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnet]
+        SecurityGroupIds: [!GetAtt LambdaSecurityGroup.GroupId]
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: lambda/notificar_cambio.zip
+
+  CFDI_Lambda_CalcularTotalMensual:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 5-CalcularTotalMensual
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnet]
+        SecurityGroupIds: [!GetAtt LambdaSecurityGroup.GroupId]
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: lambda/calcular_total_mensual.zip
+
+  CFDI_APIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CFDI-Microservice-API
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CFDI_Lambda_VerificadorSAT
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CFDI_APIGateway}/*/*"
+
+  RootResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !GetAtt CFDI_APIGateway.RootResourceId
+      PathPart: v1
+
+  Resource1:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: validar_sat
+  Method1:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource1
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+  
+  Resource2:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: proveedor
+  Method2:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource2
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_ConsultarProveedor.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+
+  Resource3:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: impuestos
+  Method3:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource3
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_ObtenerImpuestos.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+
+  Resource4:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: notificar
+  Method4:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource4
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_NotificarCambio.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource5:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: total_mensual
+  Method5:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource5
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_CalcularTotalMensual.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+
+  Resource6:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_06
+  Method6:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource6
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+
+  Resource7:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_07
+  Method7:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource7
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource8:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_08
+  Method8:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource8
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource9:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_09
+  Method9:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource9
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource10:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_10
+  Method10:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource10
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource11:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_11
+  Method11:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource11
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource12:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_12
+  Method12:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource12
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource13:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_13
+  Method13:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource13
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource14:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_14
+  Method14:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource14
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource15:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_15
+  Method15:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource15
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource16:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_16
+  Method16:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource16
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource17:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDIVPC
+      ParentId: !Ref RootResource
+      PathPart: route_17
+  Method17:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource17
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource18:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_18
+  Method18:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource18
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource19:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_19
+  Method19:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource19
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource20:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_20
+  Method20:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource20
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource21:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_21
+  Method21:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource21
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource22:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_22
+  Method22:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource22
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource23:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_23
+  Method23:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource23
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource24:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_24
+  Method24:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource24
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource25:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_25
+  Method25:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource25
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource26:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_26
+  Method26:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource26
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource27:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_27
+  Method27:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource27
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource28:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_28
+  Method28:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource28
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource29:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_29
+  Method29:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource29
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        
+  Resource30:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ParentId: !Ref RootResource
+      PathPart: route_30
+  Method30:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      ResourceId: !Ref Resource30
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CFDI_Lambda_VerificadorSAT.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - Method1
+      - Method2
+      - Method3
+      - Method4
+      - Method5
+      - Method6
+      - Method7
+      - Method8
+      - Method9
+      - Method10
+      - Method11
+      - Method12
+      - Method13
+      - Method14
+      - Method15
+      - Method16
+      - Method17
+      - Method18
+      - Method19
+      - Method20
+      - Method21
+      - Method22
+      - Method23
+      - Method24
+      - Method25
+      - Method26
+      - Method27
+      - Method28
+      - Method29
+      - Method30
+    Properties:
+      RestApiId: !Ref CFDI_APIGateway
+      
+  ProdStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod
+      RestApiId: !Ref CFDI_APIGateway
+      DeploymentId: !Ref Deployment
+
+  CFDI_EB_Application:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: CFDI-Flask-App-Min
+
+  CFDI_EB_Environment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      EnvironmentName: CFDI-Production-Env
+      ApplicationName: !Ref CFDI_EB_Application
+      SolutionStackName: 64bit Amazon Linux 2023 v4.1.1 running Python 3.11 
+      OptionSettings:
+        - Namespace: aws:ec2:vpc
+          OptionName: Subnets
+          Value: !Ref PrivateSubnet
+        - Namespace: aws:ec2:vpc
+          OptionName: ELBSubnets
+          Value: !Ref PublicSubnet
+        - Namespace: aws:ec2:vpc
+          OptionName: AssociatePublicIpAddress
+          Value: false
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: DB_HOST
+          Value: !GetAtt CFDI_RDS_Consolidada.Endpoint.Address
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: DB_DATABASE
+          Value: CFDI_DB
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: DB_USER
+          Value: !Ref DBMasterUser
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: API_GATEWAY_BASE_URL
+          Value: placeholder_api_url_manual_config_required
+          
+Outputs:
+  RDSEndpoint:
+    Description: Endpoint de la BD Consolidada
+    Value: !GetAtt CFDI_RDS_Consolidada.Endpoint.Address
+  EBLoadBalancer:
+    Description: DNS del Elastic Load Balancer (ELB)
+    Value: !GetAtt CFDI_EB_Environment.EndpointURL
+  APIGatewayURL:
+    Description: URL Base de la API Gateway (Usar para API_GATEWAY_BASE_URL en EB)
+    Value: !Sub 'https://${CFDI_APIGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
